@@ -1,0 +1,94 @@
+import asyncio
+import aiohttp
+import logging
+import json
+from time import perf_counter
+from collections import deque
+
+# ======================== Налаштування ========================
+SYMBOLS = ["XRPUSDT", "XRPUSDC", "USDCUSDT"]
+BASE_URL = "https://api.binance.com/api/v3/depth"
+LIMIT = 5
+REQUEST_INTERVAL_S = 0.001       # 1 мс пауза між запитами
+REQUEST_TIMEOUT_S = 5
+PRINT_AGG_EVERY_S = 1.0
+# =============================================================
+
+logging.basicConfig(
+    filename="error_log.txt",
+    level=logging.ERROR,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+depth_data = {s: {"bids": {}, "asks": {}} for s in SYMBOLS}
+latency_hist = {s: deque(maxlen=500) for s in SYMBOLS}
+
+async def fetch_order_book(session: aiohttp.ClientSession, symbol: str):
+    url = f"{BASE_URL}?symbol={symbol}&limit={LIMIT}"
+    t0 = perf_counter()
+    try:
+        async with session.get(url) as resp:
+            text = await resp.text()
+            if resp.status == 200:
+                data = json.loads(text)
+                depth_data[symbol]["bids"] = {float(p): float(q) for p, q in data.get("bids", [])}
+                depth_data[symbol]["asks"] = {float(p): float(q) for p, q in data.get("asks", [])}
+                dt_ms = (perf_counter() - t0) * 1000
+                latency_hist[symbol].append(dt_ms)
+                print(f"{symbol} REST {dt_ms:.2f} ms")
+            elif resp.status in (418, 429):
+                logging.error(f"{symbol} rate limited ({resp.status}): {text}")
+                await asyncio.sleep(0.5)
+            else:
+                logging.error(f"{symbol} HTTP {resp.status}: {text}")
+    except asyncio.TimeoutError:
+        logging.error(f"{symbol} timeout after {REQUEST_TIMEOUT_S}s")
+    except Exception as e:
+        logging.error(f"{symbol} fetch error: {e}")
+
+async def producer(session: aiohttp.ClientSession):
+    """
+    Послідовно робимо запити для всіх символів, 1 мс пауза між запитами.
+    """
+    while True:
+        for sym in SYMBOLS:
+            await fetch_order_book(session, sym)
+            await asyncio.sleep(REQUEST_INTERVAL_S)
+
+async def monitor():
+    while True:
+        lines = []
+        for sym in SYMBOLS:
+            hist = latency_hist[sym]
+            if hist:
+                avg = sum(hist) / len(hist)
+                lines.append(f"[{sym}] n={len(hist)} avg={avg:.2f} ms min={min(hist):.2f} ms max={max(hist):.2f} ms")
+        if lines:
+            print(" | ".join(lines))
+        await asyncio.sleep(PRINT_AGG_EVERY_S)
+
+async def main():
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S)
+    # Один TCPConnector для всіх запитів, keep-alive включений
+    connector = aiohttp.TCPConnector(
+        limit=1,               # одне TCP-з'єднання
+        force_close=False,     
+        enable_cleanup_closed=True
+    )
+    headers = {
+        "User-Agent": "rest-depth-sequential/1.0",
+        "Accept": "application/json"
+    }
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        await asyncio.gather(producer(session), monitor())
+
+if __name__ == "__main__":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Зупинено користувачем")
